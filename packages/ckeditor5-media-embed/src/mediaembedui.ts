@@ -174,11 +174,11 @@ export default class MediaEmbedUI extends Plugin {
 			.join( ', ' );
 
 		const html = `
-			<h3 class="ck ck-label">Or upload a video to the ${siteName}</h3>
+			<h3 class="ck ck-label">Or upload a video to the ${ siteName }</h3>
 
-			<input type="file" id="video-input" style="display: none;" accept="${videoFormats.join(',')}">
+			<input type="file" id="video-input" style="display: none;" accept="${ videoFormats.join( ',' ) }">
 			<div style="margin-top: 5px; font-size: 0.75em; color: #333;">
-				You can use the following video formats: ${formatsText}. Maximum file size is ${maxSizeInMb}MB.
+				You can use the following video formats: ${ formatsText }. Maximum file size is ${ maxSizeInMb }MB.
 			</div>
 
 			<div class="local-video-uploader__progress-container"
@@ -307,8 +307,8 @@ export default class MediaEmbedUI extends Plugin {
 		const urlPlaceholder = config.videoUrlPlaceholder;
 		const csrfToken = config.csrfToken || null;
 		const apiKey = config.videoUploadKey || null;
+		const videoUploadConcurrency = config.videoUploadConcurrency || 10;
 		let start = 0;
-		let chunkIndex = 0;
 		const maxAttempts = 3;
 		const progressBar = this._progressContainer.querySelector( 'div:first-child' );
 		if ( !progressBar ) {
@@ -321,19 +321,42 @@ export default class MediaEmbedUI extends Plugin {
 		const filename = this._base62( Math.trunc( Math.random() * 1e10 ) ) +
 			this._base62( Date.now() ) + `.${ extension }`;
 
+		const chunks = [];
 		while ( start < file.size ) {
-			const chunk = file.slice( start, start + chunkSize );
-			const formData = new FormData();
-			formData.append( 'file', chunk );
-			formData.append( 'chunkIndex', String( chunkIndex ) );
-			formData.append( 'totalChunks', String( totalChunks ) );
-			formData.append( 'fileName', filename );
-			formData.append( '_token', csrfToken );
-			formData.append( '_key', apiKey );
+			chunks.push( file.slice( start, start + chunkSize ) );
+			start += chunkSize;
+		}
 
-			let attempts = 0;
-			let success = false;
-			while ( attempts < maxAttempts && !success ) {
+		let successfullyUploadedChunks = 0;
+
+		function withRetry( fn: any, retries = 3, delayMs = 1000 ) {
+			return async function() {
+				let attempt = 0;
+
+				while ( attempt < retries ) {
+					try {
+						return await fn( attempt );
+					} catch ( err ) {
+						attempt++;
+						if ( attempt >= retries ) {
+							throw err;
+						}
+						await new Promise( res => setTimeout( res, delayMs ) );
+					}
+				}
+			};
+		}
+
+		const tasks = chunks.map( ( chunk: any, index: number ) =>
+			withRetry( async ( attempt: number ) => {
+				const formData = new FormData();
+				formData.append( 'file', chunk );
+				formData.append( 'chunkIndex', String( index ) );
+				formData.append( 'totalChunks', String( totalChunks ) );
+				formData.append( 'fileName', filename );
+				formData.append( '_token', csrfToken );
+				formData.append( '_key', apiKey );
+
 				try {
 					const response = await fetch( apiUrl, {
 						method: 'POST',
@@ -341,36 +364,61 @@ export default class MediaEmbedUI extends Plugin {
 					} );
 
 					if ( !response.ok ) {
-						throw new Error( `Chunk ${ chunkIndex } upload failed` );
+						throw new Error();
 					}
 
-					success = true;
-				} catch ( error ) {
-					attempts++;
-					this._showError( `Attempt ${ attempts } failed for chunk ${ chunkIndex }:` );
-					if ( attempts === maxAttempts ) {
-						this._showError( `Chunk ${ chunkIndex } failed after ${ maxAttempts } attempts.` );
-						return;
-					}
+					successfullyUploadedChunks++;
+					const progressPercent = Math.round( ( successfullyUploadedChunks / totalChunks ) * 100 );
+					progressBar.style.width = `${ progressPercent }%`;
+					progressBar.innerText = `${ progressPercent }%`;
+
+					return await response.json();
+				} catch ( error: any ) {
+					const message = attempt === maxAttempts - 1 ?
+						`Chunk ${ index } failed after ${ maxAttempts } attempts.` :
+						`Attempt ${ attempt } failed for chunk ${ index }.`;
+					this._showError( message );
+					throw new Error( message );
 				}
+			}, maxAttempts, 1000 )
+		);
+
+		const results = await this._promisePool( tasks, videoUploadConcurrency );
+
+		console.log( results );
+
+		if ( results.filter( r => r.error ).length ) {
+			this._showError( 'Video was not uploaded due to server error' );
+		} else {
+			this._hideProgress();
+			this._showSuccess( 'Video successfully uploaded' );
+			this._formView!.url = urlPlaceholder.replace( '{slug}', filename );
+			setTimeout( () => {
+				this._handleSubmitForm();
+			}, 1000 );
+		}
+	}
+
+	private async _promisePool( tasks: any, concurrency: number ) {
+		const results = new Array( tasks.length );
+		let currentIndex = 0;
+
+		async function next() {
+			const index = currentIndex++;
+			if ( index >= tasks.length ) {
+				return;
 			}
-
-			start += chunkSize;
-			chunkIndex++;
-
-			const progressPercent = Math.round( ( chunkIndex / totalChunks ) * 100 );
-			progressBar.style.width = `${ progressPercent }%`;
-			progressBar.innerText = `${ progressPercent }%`;
+			try {
+				results[ index ] = await tasks[ index ]();
+			} catch ( err ) {
+				results[ index ] = { error: err };
+			}
+			await next();
 		}
 
-		this._hideProgress();
-		this._showSuccess( 'Video successfully uploaded' );
+		await Promise.all( Array.from( { length: concurrency }, () => next() ) );
 
-		this._formView!.url = urlPlaceholder.replace('{slug}', filename);
-
-		setTimeout( () => {
-			this._handleSubmitForm();
-		}, 1000 );
+		return results;
 	}
 
 	private _base62( num: number ): string {
