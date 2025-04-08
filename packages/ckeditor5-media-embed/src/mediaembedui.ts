@@ -385,8 +385,6 @@ export default class MediaEmbedUI extends Plugin {
 
 		const results = await this._promisePool( tasks, videoUploadConcurrency );
 
-		console.log( results );
-
 		if ( results.filter( r => r.error ).length ) {
 			this._showError( 'Video was not uploaded due to server error' );
 		} else {
